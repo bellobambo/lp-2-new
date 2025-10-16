@@ -1,5 +1,5 @@
-Program path: /home/bambo/lp-2/target/deploy/lp_2.so...
-Program Id: EzpNWk2rW2byqnfsW5ctmj952hF2bqEA2BUCL2hBqSbS
+Program Id: AkDSbrdvrnfe558WDZEkGuJUayt8nChyog6bcGr1hVFm
 
-Signature: 4Xd1iA6Y8bo9qZC8mDKRk6e3KU1khgcJMCJbJgAXzSLsvze6NzQ37btAfU8zEdfAgYuaLDwCo99EhrUFRJwvS7Dz
+Signature: 3yyL1KzvFh5xogf7Xmg3ghhTAT7JM3EN8rH7L3XxRBAfishTU2rmVvd5oitPv9kHCZk1kn5kFhsuNEH32aZTydbW
 
+Deploy success

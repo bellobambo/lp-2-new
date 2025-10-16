@@ -1,7 +1,9 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
+use anchor_lang::solana_program::{system_instruction, program::invoke_signed};
 
-declare_id!("EzpNWk2rW2byqnfsW5ctmj952hF2bqEA2BUCL2hBqSbS");
+declare_id!("AkDSbrdvrnfe558WDZEkGuJUayt8nChyog6bcGr1hVFm");
+
 #[program]
 pub mod lp_program {
     use super::*;
@@ -36,7 +38,32 @@ pub mod lp_program {
         job_post.cancelled = false;
         job_post.freelancer = None;
 
-        // Transfer the job amount into escrow
+        // Derive PDA seeds for escrow
+        let job_post_key = job_post.key();
+        let escrow_key = ctx.accounts.escrow.key();
+        let bump = ctx.bumps.escrow;
+        let seeds = &[b"escrow", job_post_key.as_ref(), &[bump]];
+        let signer_seeds = &[&seeds[..]];
+
+        // Create the escrow account (a pure system account to hold lamports)
+        let lamports = Rent::get()?.minimum_balance(0).max(amount);
+        invoke_signed(
+            &system_instruction::create_account(
+                &ctx.accounts.client.key(),
+                &escrow_key,
+                lamports,
+                0, // 0 bytes = no data
+                &system_program::ID,
+            ),
+            &[
+                ctx.accounts.client.to_account_info(),
+                ctx.accounts.escrow.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
+
+        // Transfer job amount from client to escrow
         let cpi_ctx = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             system_program::Transfer {
@@ -46,11 +73,28 @@ pub mod lp_program {
         );
         system_program::transfer(cpi_ctx, amount)?;
 
+        // Update client stats
+        let client_stats = &mut ctx.accounts.client_stats;
+
+        // Get current month (1–12)
+        let month = (Clock::get()?.unix_timestamp / 2_592_000) % 12 + 1; // ~30 days
+
+        if client_stats.last_updated_month != month as u8 {
+            client_stats.monthly_gigs = 0;
+            client_stats.monthly_revenue = 0;
+            client_stats.last_updated_month = month as u8;
+        }
+
+        client_stats.total_gigs_posted += 1;
+        client_stats.monthly_gigs += 1;
+
         msg!(
-            "✅ Job post created: '{}' for {} lamports",
+            "✅ Job post created: '{}' for {} lamports. Escrow: {}",
             job_post.title,
-            amount
+            amount,
+            escrow_key
         );
+
         Ok(())
     }
 
@@ -79,8 +123,8 @@ pub mod lp_program {
         application.client_review = String::new();
         application.expected_end_date = expected_end_date;
 
-        application.submitted = false; // Add this
-        application.rejected = false; // Add this
+        application.submitted = false;
+        application.rejected = false;
 
         msg!("📩 Application submitted by {}", application.applicant);
         Ok(())
@@ -112,7 +156,6 @@ pub mod lp_program {
     }
 
     // Freelancer submits their completed work
-
     pub fn submit_work(
         ctx: Context<SubmitWork>,
         submission_link: String,
@@ -148,11 +191,12 @@ pub mod lp_program {
         let job_post = &ctx.accounts.job_post;
         let application = &mut ctx.accounts.application;
 
+        // --- VALIDATIONS ---
         require!(
             job_post.client == ctx.accounts.client.key(),
             ErrorCode::Unauthorized
         );
-        require!(application.submitted, ErrorCode::WorkNotCompleted); // ✅ FIXED
+        require!(application.submitted, ErrorCode::WorkNotCompleted);
         require!(!application.completed, ErrorCode::WorkAlreadyApproved);
         require!(
             application.job_post == job_post.key(),
@@ -163,15 +207,17 @@ pub mod lp_program {
             ErrorCode::Unauthorized
         );
 
+        // Ensure escrow has enough lamports
         require!(
             **ctx.accounts.escrow.to_account_info().lamports.borrow() >= job_post.amount,
             ErrorCode::InsufficientEscrowBalance
         );
 
+        // --- UPDATE APPLICATION STATUS ---
         application.client_review = client_review;
-        application.completed = true; // ✅ ADD THIS
+        application.completed = true;
 
-        // Transfer funds from escrow to freelancer
+        // --- TRANSFER FUNDS FROM ESCROW TO FREELANCER ---
         let job_post_key = job_post.key();
         let seeds = &[b"escrow", job_post_key.as_ref(), &[job_post.escrow_bump]];
         let signer_seeds = &[&seeds[..]];
@@ -184,9 +230,29 @@ pub mod lp_program {
             },
             signer_seeds,
         );
+
         system_program::transfer(cpi_ctx, job_post.amount)?;
 
-        msg!("💸 Funds released to freelancer.");
+        // --- UPDATE FREELANCER STATS ---
+        let freelancer_stats = &mut ctx.accounts.freelancer_stats;
+        let current_time = Clock::get()?.unix_timestamp;
+        let current_month = (current_time / 2_592_000) % 12 + 1; // ~30 days per month
+
+        if freelancer_stats.last_updated_month != current_month as u8 {
+            freelancer_stats.monthly_gigs = 0;
+            freelancer_stats.monthly_revenue = 0;
+            freelancer_stats.last_updated_month = current_month as u8;
+        }
+
+        freelancer_stats.total_revenue_earned += job_post.amount;
+        freelancer_stats.monthly_revenue += job_post.amount;
+        freelancer_stats.monthly_gigs += 1;
+
+        msg!(
+            "💸 Funds released to freelancer: {} lamports. Stats updated.",
+            job_post.amount
+        );
+
         Ok(())
     }
 
@@ -198,7 +264,7 @@ pub mod lp_program {
             job_post.client == ctx.accounts.client.key(),
             ErrorCode::Unauthorized
         );
-        require!(!application.completed, ErrorCode::WorkAlreadyApproved); // ✅ FIXED
+        require!(!application.completed, ErrorCode::WorkAlreadyApproved);
         require!(application.submitted, ErrorCode::WorkNotCompleted);
 
         application.client_review = client_review;
@@ -208,6 +274,7 @@ pub mod lp_program {
         msg!("❌ Work rejected. Feedback: {}", application.client_review);
         Ok(())
     }
+
     // Client cancels job and gets refund (only if no freelancer approved)
     pub fn cancel_job(ctx: Context<CancelJob>) -> Result<()> {
         let job_post = &mut ctx.accounts.job_post;
@@ -239,6 +306,18 @@ pub mod lp_program {
         msg!("❌ Job cancelled and funds refunded to client");
         Ok(())
     }
+
+    // Fetch user statistics
+    pub fn get_user_stats(ctx: Context<GetUserStats>) -> Result<()> {
+        let stats = &ctx.accounts.user_stats;
+        msg!("📊 User Stats:");
+        msg!("Total Gigs Posted: {}", stats.total_gigs_posted);
+        msg!("Total Revenue Earned: {}", stats.total_revenue_earned);
+        msg!("Monthly Gigs: {}", stats.monthly_gigs);
+        msg!("Monthly Revenue: {}", stats.monthly_revenue);
+        msg!("Last Updated Month: {}", stats.last_updated_month);
+        Ok(())
+    }
 }
 
 // ----------------- ACCOUNTS -----------------
@@ -257,7 +336,7 @@ pub struct JobPost {
     pub start_date: i64,
     pub end_date: i64,
     pub escrow_bump: u8,
-    pub freelancer: Option<Pubkey>, // Track approved freelancer
+    pub freelancer: Option<Pubkey>,
 }
 
 #[account]
@@ -274,10 +353,20 @@ pub struct Application {
     #[max_len(300)]
     pub client_review: String,
     pub approved: bool,
-    pub submitted: bool, // ✅ freelancer has submitted work
-    pub completed: bool, // ✅ client approved & funds released
-    pub rejected: bool,  // ✅ client rejected submission
+    pub submitted: bool,
+    pub completed: bool,
+    pub rejected: bool,
     pub expected_end_date: i64,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct UserStats {
+    pub total_gigs_posted: u64,
+    pub total_revenue_earned: u64,
+    pub monthly_gigs: u64,
+    pub monthly_revenue: u64,
+    pub last_updated_month: u8,
 }
 
 // ----------------- CONTEXTS -----------------
@@ -295,14 +384,21 @@ pub struct InitializeJobPost<'info> {
     pub job_post: Account<'info, JobPost>,
 
     #[account(
-        init,
-        payer = client,
+        mut,
         seeds = [b"escrow", job_post.key().as_ref()],
-        bump,
-        space = 8
+        bump
     )]
-    /// CHECK: Escrow account
+    /// CHECK: Escrow PDA (pure lamport vault, no data)
     pub escrow: UncheckedAccount<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = client,
+        space = 8 + UserStats::INIT_SPACE,
+        seeds = [b"user_stats", client.key().as_ref()],
+        bump
+    )]
+    pub client_stats: Account<'info, UserStats>,
 
     #[account(mut)]
     pub client: Signer<'info>,
@@ -378,15 +474,24 @@ pub struct ApproveSubmission<'info> {
         seeds = [b"escrow", job_post.key().as_ref()],
         bump = job_post.escrow_bump
     )]
-    /// CHECK: Escrow account
+    /// CHECK: Escrow PDA (pure lamport vault)
     pub escrow: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub client: Signer<'info>,
 
     #[account(mut)]
-    /// CHECK: Freelancer's wallet
-    pub freelancer: AccountInfo<'info>,
+    /// CHECK: Freelancer wallet
+    pub freelancer: UncheckedAccount<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = client,
+        space = 8 + UserStats::INIT_SPACE,
+        seeds = [b"user_stats", freelancer.key().as_ref()],
+        bump
+    )]
+    pub freelancer_stats: Account<'info, UserStats>,
 
     pub system_program: Program<'info, System>,
 }
@@ -430,6 +535,18 @@ pub struct RejectSubmission<'info> {
 
     #[account(mut)]
     pub client: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetUserStats<'info> {
+    #[account(
+        seeds = [b"user_stats", user.key().as_ref()],
+        bump
+    )]
+    pub user_stats: Account<'info, UserStats>,
+
+    /// CHECK: The user whose stats we're querying
+    pub user: UncheckedAccount<'info>,
 }
 
 // ----------------- ERRORS -----------------
